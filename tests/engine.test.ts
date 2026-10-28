@@ -1,0 +1,17 @@
+import {describe,it,expect} from 'vitest';
+import {strToU8,zipSync} from 'fflate';
+import {compareScans,exportJson,exportMarkdown,filterFiles,importReport,inspectZip,isSupported,priority,redact,scanProject,unpackZip} from '../src/lib/engine';
+describe('safe imports',()=>{
+ it('recognizes supported types and skips secrets and binaries',()=>{expect(isSupported('app/route.ts')).toBe(true);expect(isSupported('.env.example')).toBe(true);const result=filterFiles([{path:'.env',data:strToU8('PASSWORD=secret')},{path:'app.ts',data:new Uint8Array([0,2])},{path:'main.ts',data:strToU8('const x=1')}]);expect(result.files.map(x=>x.path)).toEqual(['main.ts']);expect(result.skipped).toHaveLength(2)});
+ it('rejects archive traversal and accepts a bounded archive',()=>{const valid=zipSync({'src/index.ts':strToU8('const x=1')});expect(inspectZip(valid).count).toBe(1);expect(unpackZip(valid)[0].path).toBe('src/index.ts');expect(()=>inspectZip(zipSync({'../outside.ts':strToU8('x')}))).toThrow(/Unsafe/)});
+ it('rejects malformed archives',()=>expect(()=>inspectZip(new Uint8Array([1,2,3]))).toThrow());
+});
+describe('analysis and evidence',()=>{
+ const files=[{path:'app/api/admin/route.ts',content:'export function DELETE(req: Request) {\n return db.delete(req);\n}\n'},{path:'src/main.tsx',content:'import { x } from "./util";\nconst key = eval(input);\nconst el = <div dangerouslySetInnerHTML={{__html: input}} />;\nconst token = "actual-long-secret-value";\nconst exposed = process.env.NEXT_PUBLIC_SECRET_KEY;\nlocation.assign(destination);'},{path:'src/util.ts',content:'export const x = 1;'},{path:'.github/workflows/ci.yml',content:'permissions: write-all\njobs:\n  test:\n    steps:\n      - uses: vendor/action@v1\n'},{path:'compose.yml',content:'services:\n  app:\n    privileged: true\n'}];
+ const scan=scanProject('test',files);
+ it('detects each implemented rule with file and line evidence',()=>{const ids=new Set(scan.findings.map(f=>f.ruleId));for(const id of ['JS-DYNAMIC','JS-HTML','JS-URL','SECRET-LITERAL','NEXT-PUBLIC-SECRET','ROUTE-AUTH','DOCKER-PRIVILEGED','CI-PERMISSIONS','CI-UNPINNED'])expect(ids.has(id),id).toBe(true);expect(scan.findings.every(f=>f.line>0&&f.path&&f.rationale&&f.remediation)).toBe(true)});
+ it('links imports and findings with provenance',()=>{expect(scan.edges.some(e=>e.type==='imports'&&e.target==='src/util.ts'&&!e.inferred)).toBe(true);expect(scan.edges.every(e=>!!e.provenance)).toBe(true)});
+ it('separates priority from confidence',()=>{const finding=scan.findings.find(f=>f.ruleId==='ROUTE-AUTH')!;expect(finding.confidence).toBe('manual');expect(priority(finding).score).toBe(35)});
+ it('compares snapshots without asserting causation',()=>{const clean=scanProject('test',[{path:'src/main.tsx',content:'const x=1'}]);const result=compareScans(scan,clean);expect(result.resolved.length).toBeGreaterThan(0);expect(result.changed).toContain('src/main.tsx');expect(result.uncertainty).toContain('causation')});
+ it('redacts known credential patterns and omits source from exports',()=>{expect(redact('token="actual-long-secret-value"')).not.toContain('actual-long-secret-value');const json=exportJson(scan);expect(json).not.toContain('actual-long-secret-value');expect(JSON.parse(json).files).toEqual([]);expect(exportMarkdown(scan)).not.toContain('actual-long-secret-value');expect(importReport(json).findings).toHaveLength(scan.findings.length)});
+});
